@@ -1,0 +1,191 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+import os
+import numpy as np
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+import random
+import argparse
+from keras.models import model_from_json, Model
+from keras.models import Sequential
+from keras.layers.core import Dense, Dropout, Activation, Flatten
+from keras.optimizers import Adam
+import tensorflow as tf
+import json
+
+from rememberBuffer import RememberBuffer
+from actorNetwork import ActorNetwork
+from criticNetwork import CriticNetwork
+from OU import OU
+import timeit
+import rospy
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# 导入 Env
+from src.turtlebot3_dqn.environment_stage_ddpg1 import Env
+
+OU = OU()  # Ornstein-Uhlenbeck Process
+
+
+class DDPG(object):  # 1 means Train, 0 means simply Run
+    def __init__(self, state_size, action_size):
+        self.BUFFER_SIZE = 100000
+        self.BATCH_SIZE = 32
+        self.GAMMA = 0.99
+        self.TAU = 0.001  # Target Network HyperParameters
+        self.LRA = 0.0001  # Learning rate for Actor
+        self.LRC = 0.001  # Lerning rate for Critic
+
+        self.action_dim = action_size  # Angular,Linear
+        self.state_dim = state_size  # of sensors input
+
+        np.random.seed(1337)
+
+        #vision = False
+
+        self.EXPLORE = 100000.
+        self.episode_count = 2000
+        self.max_steps = 500
+        self.reward = 0
+        self.done = False
+        self.step = 0
+        self.epsilon = 1
+        self.indicator = 0
+
+        # Tensorflow GPU optimization
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        from keras import backend as K
+        K.set_session(sess)
+
+        self.actor = ActorNetwork(sess, self.state_dim, self.action_dim, self.BATCH_SIZE, self.TAU, self.LRA)
+        self.critic = CriticNetwork(sess, self.state_dim, self.action_dim, self.BATCH_SIZE, self.TAU, self.LRC)
+        self.buff = RememberBuffer(self.BUFFER_SIZE)  # Create replay buffer
+
+
+
+        self.dirPath = os.path.dirname(os.path.realpath(__file__))
+        self.dirPath = self.dirPath.replace('turtlebot3_dqn/nodes', 'turtlebot3_dqn/model/')
+        # Now load the weight
+        print("Now load the weights")
+        try:
+            self.actor.model.load_weights(self.dirPath+"actormodel.h5")
+            self.critic.model.load_weights(self.dirPath+"criticmodel.h5")
+            self.actor.target_model.load_weights(self.dirPath+"actormodel.h5")
+            self.critic.target_model.load_weights(self.dirPath+"criticmodel.h5")
+            print("Weight load successfully")
+        except:
+            print("Cannot find the weight")
+
+    def getAction(self, state):
+        action = self.actor.model.predict(state.reshape(1, state.shape[0]))
+        action[0][0] += max(self.epsilon, 0) * OU.function(action[0][0], 0.0, 0.60, 0.30)
+        action[0][1] += max(self.epsilon, 0) * OU.function(action[0][1], 0.5, 1.00, 0.10)
+        action[0][0] = round(action[0][0], 2)
+        action[0][1] = round(action[0][1], 2)
+        return action
+
+    def batchUpdate(self):
+        # Do the batch update
+        #print("Now bacth update")
+        batch = self.buff.getBatch(self.BATCH_SIZE)
+        states = np.asarray([e[0] for e in batch])
+        actions = np.asarray([e[1] for e in batch])
+        rewards = np.asarray([e[2] for e in batch])
+        new_states = np.asarray([e[3] for e in batch])
+        dones = np.asarray([e[4] for e in batch])
+        y_t = np.asarray([e[2] for e in batch])
+        target_q_values = self.critic.target_model.predict([new_states, self.actor.target_model.predict(new_states)])
+
+        for k in range(len(batch)):
+            if dones[k]:
+                y_t[k] = rewards[k]
+            else:
+                y_t[k] = rewards[k] + self.GAMMA * target_q_values[k]
+
+        #print(y_t)
+        loss = self.critic.model.train_on_batch([states, actions], y_t)
+        a_for_grad = self.actor.model.predict(states)
+        grads = self.critic.gradients(states, a_for_grad)
+        self.actor.train(states, grads)
+        self.actor.target_train()
+        self.critic.target_train()
+        return loss
+
+    def save_Weights(self):
+        #print("Now we save model")
+        self.actor.model.save_weights(self.dirPath+"actormodel.h5", overwrite=True)
+        with open(self.dirPath+"actormodel.json", "w") as outfile:
+            json.dump(self.actor.model.to_json(), outfile)
+
+        self.critic.model.save_weights(self.dirPath+"criticmodel.h5", overwrite=True)
+        with open(self.dirPath+"criticmodel.json", "w") as outfile:
+            json.dump(self.critic.model.to_json(), outfile)
+
+
+    def train(self, env):
+        print("ROS Experiment Start.")
+        for i in range(self.episode_count):
+            print("Episode : " + str(i) + " Replay Buffer " + str(self.buff.count()))
+            losses = []
+            state = env.reset()
+            total_reward = 0.
+            for j in range(self.max_steps):
+                self.epsilon -= 1.0 / self.EXPLORE
+                action = self.getAction(state)
+                new_state, reward, done = env.step(action[0])
+
+                self.buff.add(state, action[0], reward, new_state, done)  # Add replay buffer
+                loss = self.batchUpdate()
+                losses.append(loss)
+                total_reward += reward
+                state = new_state
+
+                print("Episode", i, "Step", self.step, "Action", action[0], "Reward", reward, "Loss_Current", loss)
+
+                self.step += 1
+                if done:
+                    break
+            loss = np.mean(losses)
+            self.save_Weights()
+            print("TOTAL REWARD @ " + str(i) + "-th Episode  : Reward " + str(total_reward) + "  Loss:"+str(loss))
+            print("Total Step: " + str(self.step))
+            print("")
+
+        #env.end()  # This is for shutting down ROS
+        print("Finish.")
+
+
+
+    def play(self,env):
+        """play game with model.
+        """
+        print('play...')
+        observation =env.reset()
+
+        reward_sum = 0
+        random_episodes = 0
+
+        while random_episodes < 50:
+            action = self.getAction(observation)
+            new_state, reward, done = env.step(action[0])
+
+            reward_sum += reward
+
+            if done:
+                print("Reward for this episode was: {}".format(reward_sum))
+                random_episodes += 1
+                reward_sum = 0
+                observation = env.reset()
+
+
+if __name__ == "__main__":
+    rospy.init_node('turtlebot3_ddpg')
+    state_size = 24
+    action_size = 2
+    # Generate a ROS environment
+    env = Env(action_size)
+    #DDPG(state_size, action_size).train(env)
+    DDPG(state_size, action_size).play(env)
